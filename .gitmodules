@@ -1,7 +1,8 @@
 [submodule "third_party/wifi-sdr"]
 	path = third_party/wifi-sdr
-	url = https://github.com/gilankpam/wifi-sdr.git
-	branch = kepyur-android
+	url = https://github.com/albertonoys/wifi-sdr.git
+	branch = android
 [submodule "third_party/libusb"]
 	path = third_party/libusb
-	url = https://github.com/libusb/libusb.git
+	url = https://github.com/albertonoys/libusb.git
+	branch = master
