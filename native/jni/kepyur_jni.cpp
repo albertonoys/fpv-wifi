@@ -144,10 +144,10 @@ JNIEXPORT jstring JNICALL Java_com_kepyur_app_Native_usb3Switch(JNIEnv *env, jcl
   return env->NewStringUTF(out.c_str());
 }
 
-JNIEXPORT jstring JNICALL Java_com_kepyur_app_Native_open(JNIEnv *env, jclass, jint fd) {
+JNIEXPORT jstring JNICALL Java_com_kepyur_app_Native_open(JNIEnv *env, jclass, jint fd, jboolean usbReset) {
   std::lock_guard<std::mutex> l(g_api);
   try {
-    g_radio->open(fd);
+    g_radio->open(fd, usbReset);
     return env->NewStringUTF("");
   } catch (const std::exception &e) {
     KP_LOGE("open failed: %s", e.what());
@@ -167,6 +167,11 @@ JNIEXPORT jboolean JNICALL Java_com_kepyur_app_Native_superspeed(JNIEnv *, jclas
 JNIEXPORT void JNICALL Java_com_kepyur_app_Native_scan(JNIEnv *, jclass) {
   std::lock_guard<std::mutex> l(g_api);
   if (g_radio && g_radio->is_open()) g_radio->scan();
+}
+
+JNIEXPORT void JNICALL Java_com_kepyur_app_Native_idle(JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> l(g_api);
+  if (g_radio && g_radio->is_open()) g_radio->idle();
 }
 
 JNIEXPORT void JNICALL Java_com_kepyur_app_Native_watch(JNIEnv *, jclass, jdouble hz) {

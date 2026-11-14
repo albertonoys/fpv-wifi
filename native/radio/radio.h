@@ -41,7 +41,7 @@ public:
 
   // fd >= 0: the adapter behind this usbfs fd (Android); fd < 0: the first 8812BU on the bus (desktop).
   // Blocking (~5 s chip bring-up). Throws std::exception with a user-presentable message.
-  void open(int fd);
+  void open(int fd, bool usb_reset = false);  // usb_reset: reset the adapter first (reopen after a stall)
   void close();
   bool is_open() const;
   bool superspeed() const;
@@ -92,6 +92,7 @@ private:
   double _watch_hz = 0, _req_hz = 0;
   int _req_rate = 1;
   int _watch_rate = 1;
+  int _min_rate_sel = 1;  // fastest rate_sel the link sustains (USB 2 caps this above 1); test clamps to it
   bool _fallback = false;  // 40 MS/s kept faulting during a watch: watch at 20 MS/s until open() / set_watch_rate()
   double _gain_db = -1;
   // recording (DSP thread writes; the request is under _m)
@@ -153,6 +154,7 @@ private:
   double _resume_hz = 0;
   // test
   uint64_t _test_banks = 0, _test_gaps = 0, _test_last_seq = 0, _test_runs = 0;
+  uint64_t _test_restarts0 = 0, _test_dropped0 = 0;  // the counters at the phase's start (they count since open)
   uint32_t _test_gen = 0;
   int64_t _test_t0_ms = 0, _test_end_ms = 0;
   double _test_fs = 0;

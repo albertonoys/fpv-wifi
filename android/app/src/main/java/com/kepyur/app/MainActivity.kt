@@ -54,9 +54,12 @@ class MainActivity : Activity() {
     private var device: UsbDevice? = null
     private var conn: UsbDeviceConnection? = null
     private var expectReenumerate = false
+    private val reopens = ArrayDeque<Long>()  // times of automatic reopens after a stream stall
     private var mode = "normal"
     private val testPlan = ArrayDeque<Pair<Int, Double>>()
     private var testRunning = false
+    private var currentTest: Pair<Int, Double>? = null  // the phase running (kept across a reopen)
+    private lateinit var testButton: Button
     private val testResults = mutableListOf<String>()
 
     // views
@@ -68,6 +71,8 @@ class MainActivity : Activity() {
     private lateinit var panel: LinearLayout
     private lateinit var panelHeader: TextView
     private lateinit var pilotRows: LinearLayout
+    private lateinit var scanButton: Button
+    private var scanning = false
     private lateinit var handle: TextView
     private var panelShown = true
     private var lastLabelTouch = 0L
@@ -75,6 +80,15 @@ class MainActivity : Activity() {
     private var watchingHz = 0.0
 
     private val permAction = "com.kepyur.app.USB_PERMISSION"
+
+    private val settleMs = 1000L  // pause after the link comes up, before streaming (lets USB 3 settle)
+
+    // Once we see the adapter stuck at USB 2 this session, stop re-attempting the switch — each
+    // attempt forces a detach/reattach cycle that stalls the stream. Deliberately NOT persisted:
+    // the RTL8822BU boots as USB 2 and only becomes USB 3 once we send the switch, so a sticky skip
+    // would pin a USB-3-capable host (a phone) at USB 2 forever. Re-probed every launch instead; a
+    // USB-2-only host (the tablet) just re-churns once per launch.
+    private var skipUsb3 = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -121,6 +135,13 @@ class MainActivity : Activity() {
             Native.log("debug: watch rate_sel $r")
             if (watchingHz > 0 && state == State.RUNNING) Native.watch(watchingHz)
         }
+        if (i.hasExtra("usb3")) {
+            // --ez usb3 false  -> skip the switch (USB-2-only host); --ez usb3 true -> try it again.
+            // shortcut: the skip flag is global, not per-host; moving the adapter to a USB-3 host
+            // needs `--ez usb3 true` once to re-enable the switch.
+            skipUsb3 = !i.getBooleanExtra("usb3", true)
+            Native.log("debug: usb3 switch ${if (skipUsb3) "disabled" else "enabled"}")
+        }
         if (i.hasExtra("record")) {
             val secs = i.getFloatExtra("record", 3f).toDouble()
             val name = "rec-" + java.text.SimpleDateFormat("HHmmss", java.util.Locale.US).format(java.util.Date())
@@ -147,7 +168,7 @@ class MainActivity : Activity() {
         (d.vendorId == 0x2357 && d.productId in setOf(0x0115, 0x012d, 0x0138)) ||
             (d.vendorId == 0x0bda && d.productId == 0xb812)
 
-    private fun connect() {
+    private fun connect(reset: Boolean = false) {  // reset: reopen a stalled adapter in place (reset it first)
         if (state == State.OPENING || state == State.RUNNING) return
         val d = usb.deviceList.values.firstOrNull { ours(it) }
         if (d == null) {
@@ -174,7 +195,8 @@ class MainActivity : Activity() {
         Native.log("adapter ${d.deviceName} ${"%04x:%04x".format(d.vendorId, d.productId)} fd=$fd")
         setState(State.OPENING)
         worker.execute {
-            val sw = Native.usb3Switch(fd)
+            val sw = if (skipUsb3) "skipped".also { Native.log("usb3 switch: skipped (host is USB 2)") }
+                     else Native.usb3Switch(fd)
             if (sw.startsWith("requested")) {
                 // the adapter drops off the bus and comes back as SuperSpeed: a new device, a new permission
                 ui.post {
@@ -185,12 +207,25 @@ class MainActivity : Activity() {
                 }
                 return@execute
             }
-            val err = Native.open(fd)
+            val err = Native.open(fd, reset)
+            // Let the freshly-enumerated SuperSpeed link settle before hammering it with a stream.
+            if (err.isEmpty() && settleMs > 0) {
+                Native.log("settling ${settleMs} ms before streaming")
+                try { Thread.sleep(settleMs) } catch (_: InterruptedException) {}
+            }
             ui.post {
                 expectReenumerate = false
                 when {
                     err.isNotEmpty() -> fail("Radio did not start: $err")
-                    !Native.superspeed() -> setState(State.USB2)
+                    // usbtest is a throughput probe — let it run at USB 2 too; only normal
+                    // (video) mode stops at the USB2 notice, since video needs the bandwidth.
+                    !Native.superspeed() && mode != "usbtest" -> {
+                        if (!skipUsb3) {
+                            skipUsb3 = true
+                            Native.log("usb3 not available on this host: skipping the switch from now on")
+                        }
+                        setState(State.USB2)
+                    }
                     else -> {
                         setState(State.RUNNING)
                         startWork()
@@ -202,6 +237,14 @@ class MainActivity : Activity() {
 
     private fun startWork() {
         if (mode == "usbtest") {
+            val cur = currentTest
+            if (cur != null) {
+                // the radio was reopened mid-test: rerun the phase that stalled, keep the finished ones
+                testRunning = true
+                Native.log("usbtest: resuming rate_sel ${cur.first} for ${cur.second} s")
+                Native.streamTest(cur.first, cur.second)
+                return
+            }
             testPlan.clear(); testResults.clear()
             testPlan.add(1 to 60.0)   // 40 MS/s for 60 s
             testPlan.add(2 to 60.0)   // 20 MS/s for 60 s
@@ -214,6 +257,7 @@ class MainActivity : Activity() {
 
     private fun nextTest() {
         val t = testPlan.removeFirstOrNull()
+        currentTest = t
         if (t == null) {
             testRunning = false
             Native.log("usbtest: all done: ${testResults.joinToString(" | ")}")
@@ -226,6 +270,14 @@ class MainActivity : Activity() {
         testRunning = true
         Native.log("usbtest: rate_sel ${t.first} for ${t.second} s")
         Native.streamTest(t.first, t.second)
+    }
+
+    private fun stopTest() {
+        testPlan.clear(); currentTest = null; testRunning = false
+        Native.log("usbtest: stopped: ${testResults.joinToString(" | ")}")
+        testResults.clear(); reopens.clear()  // clear the progress and the 3 reopen strikes
+        mode = "normal"
+        Native.idle()
     }
 
     private fun closeRadio() {
@@ -284,7 +336,47 @@ class MainActivity : Activity() {
     }
 
     private fun render(s: JSONObject) {
+        // lost / error end the receiver for good: without this a scan or USB test waits forever
+        val rx = s.optString("rx_state")
+        if (rx == "lost" || rx == "error") {
+            testRunning = false
+            closeRadio()
+            // a stalled stream with the adapter still plugged in: reopen it, at most 3 times in 2 minutes
+            val now = System.currentTimeMillis()
+            reopens.removeAll { now - it > 120_000 }
+            if (rx == "error" && reopens.size < 3 && usb.deviceList.values.any { ours(it) }) {
+                reopens.add(now)
+                Native.log("reopening the radio after: ${s.optString("rx_error")}")
+                setState(State.NO_ADAPTER)
+                connect(reset = true)  // reset the adapter: a bare reopen leaves a wedged stream wedged
+                return
+            }
+            // Retries exhausted at this rate. In a USB test, a rate that can't stream shouldn't trap
+            // the session: record it failed and drop to the next (lower) phase so the test still finishes.
+            if (mode == "usbtest" && currentTest != null) {
+                val sel = currentTest!!.first
+                testResults.add("""{"rate_msps":${if (sel == 1) 40 else 20},"failed":true}""")
+                Native.log("usbtest: rate_sel $sel could not stream here; dropping to the next rate")
+                reopens.clear()
+                currentTest = testPlan.removeFirstOrNull()
+                if (currentTest != null && usb.deviceList.values.any { ours(it) }) {
+                    setState(State.NO_ADAPTER)
+                    connect(reset = true)  // next phase on the same stalled adapter: reset it first
+                    return
+                }
+                testRunning = false
+                mode = "normal"
+                Native.log("usbtest: all done: ${testResults.joinToString(" | ")}")
+                fail("USB test done — no rate would stream on this link:\n${testResults.joinToString(" | ")}")
+                return
+            }
+            fail(s.optString("rx_error") + "\nReplug the adapter to try again (a USB hub helps on some phones).")
+            return
+        }
         val m = s.optString("mode")
+        scanning = m == "scan"
+        scanButton.text = if (scanning) "Stop scan" else "Rescan"
+        testButton.text = if (testRunning) "Stop test" else "USB test"
         val video = s.optJSONObject("video")
         val locked = video?.optBoolean("locked") ?: false
         watchingHz = if (m == "watch") s.optDouble("watch_hz") else watchingHz
@@ -411,12 +503,19 @@ class MainActivity : Activity() {
         pilotRows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         panel.addView(ScrollView(this).apply { addView(pilotRows) }, LinearLayout.LayoutParams(-1, 0, 1f))
         val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(dpi(8f), 0, dpi(8f), 0) }
-        buttons.addView(Button(this).apply {
-            text = "Rescan"; setOnClickListener { if (state == State.RUNNING) Native.scan() }
-        }, LinearLayout.LayoutParams(0, -2, 1f))
-        buttons.addView(Button(this).apply {
-            text = "USB test"; setOnClickListener { if (state == State.RUNNING) { mode = "usbtest"; startWork() } }
-        }, LinearLayout.LayoutParams(0, -2, 1f))
+        scanButton = Button(this).apply {
+            text = "Rescan"
+            setOnClickListener { if (state == State.RUNNING) { if (scanning) Native.idle() else Native.scan() } }
+        }
+        buttons.addView(scanButton, LinearLayout.LayoutParams(0, -2, 1f))
+        testButton = Button(this).apply {
+            text = "USB test"
+            setOnClickListener {
+                if (testRunning) stopTest()
+                else if (state == State.RUNNING) { mode = "usbtest"; currentTest = null; startWork() }
+            }
+        }
+        buttons.addView(testButton, LinearLayout.LayoutParams(0, -2, 1f))
         panel.addView(buttons)
         root.addView(panel, FrameLayout.LayoutParams(0, -1, Gravity.END))
 

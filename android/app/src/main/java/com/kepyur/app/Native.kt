@@ -10,10 +10,11 @@ object Native {
     /** USB 2 -> 3 switch on this fd: "requested" means the adapter is re-enumerating now. */
     @JvmStatic external fun usb3Switch(fd: Int): String
     /** Blocking (~5 s). Returns "" on success, else a message. */
-    @JvmStatic external fun open(fd: Int): String
+    @JvmStatic external fun open(fd: Int, usbReset: Boolean): String
     @JvmStatic external fun close()
     @JvmStatic external fun superspeed(): Boolean
     @JvmStatic external fun scan()
+    @JvmStatic external fun idle()
     @JvmStatic external fun watch(hz: Double)
     @JvmStatic external fun streamTest(rateSel: Int, seconds: Double)
     /** Debug: the rate watch uses (2 = 20 MS/s, 1 = 40 MS/s), from the next watch on. */

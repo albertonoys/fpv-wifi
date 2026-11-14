@@ -68,7 +68,7 @@ bool Radio::superspeed() const {
   return _superspeed;
 }
 
-void Radio::open(int fd) {
+void Radio::open(int fd, bool usb_reset) {
   close();
   auto log = std::make_shared<Logger>();
   auto rx = std::make_unique<wsdr::Receiver>(log);
@@ -77,6 +77,7 @@ void Radio::open(int fd) {
   s.rate_sel = 1;  // 40 MS/s
   s.wide = true;
   s.agc = true;
+  s.usb_reset = usb_reset;  // reopen after a stall: reset the adapter so a wedged stream recovers
   KP_LOGI("radio: opening adapter (%s)", fd >= 0 ? "Android fd" : "bus scan");
   rx->open(wsdr::kPid8812bu, s, -1, {}, fd);
   const auto caps = rx->caps();
@@ -90,6 +91,7 @@ void Radio::open(int fd) {
   {
     std::lock_guard<std::mutex> l(_m);
     _superspeed = caps.superspeed;
+    _min_rate_sel = caps.min_rate_sel;
     _chip = caps.chip;
     _open = true;
     _mode = Mode::Idle;
@@ -197,7 +199,9 @@ void Radio::stream_test(int rate_sel, double seconds) {
   std::lock_guard<std::mutex> l(_m);
   _mode = Mode::Test;
   _mode_epoch++;
-  _req_rate = rate_sel;
+  // A rate faster than the link sustains delivers no banks at all (USB 2 asked for 40 MS/s
+  // just stalls). Clamp down to the fastest the link can carry so the test actually streams.
+  _req_rate = rate_sel < _min_rate_sel ? _min_rate_sel : rate_sel;
   _test_end_ms = static_cast<int64_t>(seconds * 1000);
 }
 
@@ -310,6 +314,8 @@ void Radio::dsp_loop() {
         }
         _test_banks = _test_gaps = 0;
         _test_last_seq = 0;
+        _test_restarts0 = _rx ? _rx->status().restarts : 0;
+        _test_dropped0 = _dropped.load();
         _test_t0_ms = 0;
         _test_fs = wsdr::Receiver::rate_of(rate);
         KP_LOGI("radio: stream test at %.1f MS/s", _test_fs / 1e6);
@@ -649,7 +655,8 @@ void Radio::handle_test(Bank &b) {
   o << "{\"rate_msps\":" << b.fs / 1e6 << ",\"seconds\":" << el << ",\"banks\":" << _test_banks
     << ",\"expected\":" << static_cast<uint64_t>(expect) << ",\"seq_gaps\":" << _test_gaps
     << ",\"stream_runs\":" << _test_runs
-    << ",\"restarts\":" << _rx->status().restarts << ",\"queue_dropped\":" << _dropped.load()
+    << ",\"restarts\":" << _rx->status().restarts - _test_restarts0
+    << ",\"queue_dropped\":" << _dropped.load() - _test_dropped0
     << ",\"done\":" << (el * 1000 >= _test_end_ms ? "true" : "false") << "}";
   std::lock_guard<std::mutex> l(_m);
   _test_result = o.str();
